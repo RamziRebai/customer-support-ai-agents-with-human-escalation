@@ -1,0 +1,1395 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { createClient } from '@supabase/supabase-js';
+import {
+  Container,
+  Box,
+  TextField,
+  Button,
+  Typography,
+  Paper,
+  List,
+  ListItem,
+  ListItemText,
+  Divider,
+  AppBar,
+  Toolbar,
+  IconButton,
+  Avatar,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Tab,
+  Tabs,
+  Grid,
+  Alert,
+  Snackbar,
+  Link,
+  Chip,
+  Fade,
+  Zoom,
+  Badge,
+  useTheme,
+  useMediaQuery
+} from '@mui/material';
+import {
+  Send as SendIcon,
+  ExitToApp as LogoutIcon,
+  Google as GoogleIcon,
+  GitHub as GitHubIcon,
+  Facebook as FacebookIcon,
+  Email as EmailIcon,
+  Lock as LockIcon,
+  ArrowBack as ArrowBackIcon,
+  SupportAgent as SupportIcon,
+  Computer as ComputerIcon,
+  AttachMoney as BillingIcon
+} from '@mui/icons-material';
+import './App.css';
+
+// Initialize Supabase client - replace with your actual keys
+const supabaseUrl = process.env.REACT_APP_SUPABASE_URL || 'https://your-supabase-url.supabase.co';
+const supabaseKey = process.env.REACT_APP_SUPABASE_ANON_KEY || 'your-supabase-anon-key';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// WebSocket configuration
+const WS_URL = process.env.REACT_APP_SOCKET_URL || 'ws://localhost:3001';
+const RECONNECT_INTERVAL = 3000; // 3 seconds
+const MAX_RECONNECT_ATTEMPTS = 10;
+const STREAMING_SPEED = 50; // Milliseconds per character
+
+function App() {
+  // State variables
+  const [user, setUser] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [inputMessage, setInputMessage] = useState('');
+  const [ws, setWs] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [authView, setAuthView] = useState('login');
+  const [loginDialogOpen, setLoginDialogOpen] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [connectionStatus, setConnectionStatus] = useState('disconnected');
+  const [typingIndicator, setTypingIndicator] = useState(false);
+  const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'info' });
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const [currentAssistant, setCurrentAssistant] = useState('ToGeneralAssistant');
+  const [transferInProgress, setTransferInProgress] = useState(false);
+  const [previousAssistant, setPreviousAssistant] = useState(null);
+  const [initialMessagesLoaded, setInitialMessagesLoaded] = useState(false);
+
+  const theme = useTheme();
+  const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
+
+  const messagesEndRef = useRef(null);
+  const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+  const workerRef = useRef(null); // For the Web Worker
+
+  // Helper to get the normalized assistant value from backend response
+  const getCurrentAssistant = (data) => data.currentAssistant || data.current_assistant || '';
+
+  const clearAuthFields = () => {
+    setAuthEmail('');
+    setAuthPassword('');
+    setConfirmPassword('');
+  };
+
+  const assistantConfig = {
+    ToGeneralAssistant: {
+      name: "General Assistant",
+      color: "#3f51b5",
+      icon: <SupportIcon />,
+      description: "I can help with general inquiries about our products and services."
+    },
+    ToTechnicalAssistant: {
+      name: "Technical Assistant",
+      color: "#00796b",
+      icon: <ComputerIcon />,
+      description: "I specialize in technical support and troubleshooting."
+    },
+    ToBillingAssistant: {
+      name: "Billing Assistant",
+      color: "#5e35b1",
+      icon: <BillingIcon />,
+      description: "I can assist with billing, payments, and account inquiries."
+    }
+  };
+
+  // Initialize and manage Web Worker for streaming
+  useEffect(() => {
+    // Create a new Web Worker instance when the component mounts.
+    // The worker script (streamingWorker.js) is loaded from the public folder.
+    workerRef.current = new Worker(process.env.PUBLIC_URL + '/streamingWorker.js');
+
+    // Define how to handle messages received from the worker.
+    workerRef.current.onmessage = (event) => {
+      const { type, messageId, contentPart, fullText } = event.data;
+      if (type === 'update') {
+        // When the worker sends an 'update', update the specific message's content.
+        setMessages(prevMessages =>
+          prevMessages.map(msg =>
+            msg.id === messageId ? { ...msg, content: contentPart } : msg
+          )
+        );
+      } else if (type === 'done') {
+        // When the worker signals 'done', finalize the message content and mark streaming as complete.
+        setMessages(prevMessages =>
+          prevMessages.map(msg =>
+            msg.id === messageId ? { ...msg, content: fullText, streaming: false } : msg
+          )
+        );
+      }
+    };
+
+    // Optional: Handle errors from the worker.
+    workerRef.current.onerror = (error) => {
+      console.error("Streaming Worker Error:", error);
+      // Implement fallback or error notification if necessary.
+    };
+
+    // Cleanup: Terminate the worker when the component unmounts to free resources.
+    return () => {
+      workerRef.current.terminate();
+    };
+  }, []); // Empty dependency array ensures this effect runs only once on mount and cleanup on unmount.
+
+  // Function to initiate message content streaming via the Web Worker
+  const streamMessageContent = (messageId, fullText) => {
+    if (workerRef.current) {
+      // Send the full text and message ID to the worker to start the streaming process.
+      // The worker will then send back parts of the text incrementally.
+      workerRef.current.postMessage({ messageId, fullText, speed: STREAMING_SPEED });
+    }
+  };
+
+  // Load messages from localStorage on user login/initial load
+  useEffect(() => {
+    if (user && user.id && !initialMessagesLoaded) {
+      try {
+        const storedMessages = localStorage.getItem(`chatMessages_${user.id}`);
+        if (storedMessages) {
+          const parsedMessages = JSON.parse(storedMessages);
+          if (parsedMessages.length > 0) {
+            setMessages(parsedMessages.map(msg => ({...msg, streaming: false}))); // Ensure streaming is false for loaded messages
+          }
+        }
+      } catch (e) {
+        console.error("Failed to load messages from localStorage", e);
+        localStorage.removeItem(`chatMessages_${user.id}`);
+      }
+      setInitialMessagesLoaded(true);
+    }
+  }, [user, initialMessagesLoaded]);
+
+  // Save messages to localStorage
+  useEffect(() => {
+    if (user && user.id && initialMessagesLoaded && messages.length > 0) {
+      const messagesToSave = messages.map(msg => {
+        if (msg.streaming) {
+          return { ...msg, streaming: undefined }; // Don't save streaming flag
+        }
+        return msg;
+      });
+      try {
+        localStorage.setItem(`chatMessages_${user.id}`, JSON.stringify(messagesToSave));
+      } catch (e) {
+        console.error("Failed to save messages to localStorage", e);
+      }
+    }
+  }, [user, messages, initialMessagesLoaded]);
+
+  const handleLogin = async () => {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: authEmail,
+      password: authPassword,
+    });
+    if (error) throw error;
+    setUser(data.user);
+    setLoginDialogOpen(false);
+    clearAuthFields();
+  };
+
+  const handleSignup = async () => {
+    if (authPassword !== confirmPassword) {
+      throw new Error('Passwords do not match');
+    }
+    const { data, error } = await supabase.auth.signUp({
+      email: authEmail,
+      password: authPassword,
+      options: { emailRedirectTo: window.location.origin },
+    });
+    if (error) throw error;
+    if (data.user && data.user.identities?.length === 0) {
+      showSnackbar('Email already registered. Please log in.', 'warning');
+      setAuthView('login');
+    } else {
+      showSnackbar('Check your email for the confirmation link!', 'info');
+      setAuthView('login');
+    }
+    clearAuthFields();
+  };
+
+  const handleResetPassword = async () => {
+    if (authPassword) {
+      const { error } = await supabase.auth.updateUser({ password: authPassword });
+      if (error) throw error;
+      showSnackbar('Password updated successfully!', 'success');
+      setAuthView('login');
+      clearAuthFields();
+    } else {
+      const { error } = await supabase.auth.resetPasswordForEmail(authEmail, {
+        redirectTo: window.location.origin,
+      });
+      if (error) throw error;
+      showSnackbar('Password reset email sent!', 'success');
+      setAuthView('login');
+      clearAuthFields();
+    }
+  };
+
+  const handleMagicLink = async () => {
+    const { error } = await supabase.auth.signInWithOtp({
+      email: authEmail,
+      options: { emailRedirectTo: window.location.origin },
+    });
+    if (error) throw error;
+    showSnackbar('Check your email for the magic link!', 'info');
+    setAuthView('login');
+    clearAuthFields();
+  };
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      if (authView === 'login') await handleLogin();
+      else if (authView === 'signup') await handleSignup();
+      else if (authView === 'reset-password') await handleResetPassword();
+      else if (authView === 'magic-link') await handleMagicLink();
+    } catch (error) {
+      console.error('Auth error:', error);
+      showSnackbar(error.message || 'Authentication failed', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSocialLogin = async (provider) => {
+    setLoading(true);
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider,
+        options: { redirectTo: window.location.origin },
+      });
+      if (error) throw error;
+    } catch (error) {
+      console.error(`${provider} login error:`, error);
+      showSnackbar(`${provider} login failed: ${error.message}`, 'error');
+      setLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setLoading(true);
+    try {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+        setWs(null);
+      }
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      
+      if (user && user.id) {
+        try {
+          localStorage.removeItem(`chatMessages_${user.id}`);
+        } catch (e) {
+          console.error("Failed to remove messages from localStorage on logout", e);
+        }
+      }
+
+      await supabase.auth.signOut();
+      setMessages([]);
+      setConnectionStatus('disconnected');
+      setCurrentAssistant('ToGeneralAssistant'); 
+      setInitialMessagesLoaded(false); // Reset for next user
+      setPreviousAssistant(null);
+      setTransferInProgress(false);
+
+    } catch (error) {
+      console.error('Logout error:', error);
+      showSnackbar('Logout failed: ' + error.message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Delete conversation handler
+  const handleDeleteConversation = () => {
+    if (user && user.id) {
+      localStorage.removeItem(`chatMessages_${user.id}`);
+    }
+    setMessages([]);
+    showSnackbar('Conversation deleted.', 'success');
+  };
+
+  const connectWebSocket = () => {
+    if (!user || !user.email) {
+      console.log("User or user email not available, WebSocket connection skipped.");
+      return;
+    }
+    try {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) wsRef.current.close();
+      const wsUrl = `${WS_URL}?sessionId=${encodeURIComponent(user.email)}`;
+      const socket = new WebSocket(wsUrl);
+      wsRef.current = socket;
+      socket.onopen = handleSocketOpen;
+      socket.onmessage = handleSocketMessage;
+      socket.onclose = handleSocketClose;
+      socket.onerror = handleSocketError;
+      setWs(socket);
+    } catch (error) {
+      console.error('WebSocket connection error:', error);
+      setConnectionStatus('error');
+      handleReconnect();
+    }
+  };
+
+  const handleSocketOpen = () => {
+    console.log('WebSocket connected');
+    setConnectionStatus('connected');
+    setReconnectAttempts(0);
+    startHeartbeat();
+  };
+
+  const handleSocketMessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      console.log('Received message from server:', data);
+      setTypingIndicator(false);
+
+      if (data.error) {
+        showSnackbar(`Server error: ${data.error}`, 'error');
+        return;
+      }
+
+      const newAssistantId = getCurrentAssistant(data);
+
+      // Only trigger transition if assistant actually changes
+      if (newAssistantId && newAssistantId !== currentAssistant) {
+        setPreviousAssistant(currentAssistant);
+        setCurrentAssistant(newAssistantId);
+        setTransferInProgress(true);
+
+        setMessages(prev => [
+          ...prev,
+          {
+            id: `system-${Date.now()}`,
+            content: `Transferring you to our ${assistantConfig[newAssistantId]?.name || 'specialized assistant'}...`,
+            sender: 'system',
+            timestamp: new Date().toISOString()
+          }
+        ]);
+
+        setTimeout(() => {
+          setTransferInProgress(false);
+        }, 800);
+      }
+      // If assistant is the same, do NOT re-render header or show transfer annotation
+
+      if (data.response) {
+        const messageId = `assistant-${Date.now()}`;
+        const newAssistantMessage = {
+          id: messageId,
+          content: '',
+          sender: 'assistant',
+          timestamp: new Date().toISOString(),
+          assistantType: newAssistantId || currentAssistant,
+          streaming: true,
+        };
+        setMessages(prev => [...prev, newAssistantMessage]);
+        streamMessageContent(messageId, data.response);
+        return;
+      }
+
+      switch (data.type) {
+        case 'connected':
+          console.log('Connection established with ID:', data.clientId);
+          break;
+        case 'typing':
+          setTypingIndicator(data.value);
+          break;
+        case 'pong':
+          console.log("Pong received");
+          break;
+        default:
+          console.log('Received unhandled message structure or type:', data);
+      }
+    } catch (error) {
+      console.error('Error parsing WebSocket message:', error);
+      console.error('Raw message data:', event.data);
+    }
+  };
+
+  const handleSocketClose = (event) => {
+    console.log(`WebSocket closed: ${event.code} - ${event.reason}`);
+    setConnectionStatus('disconnected');
+    handleReconnect();
+  };
+
+  const handleSocketError = (error) => {
+    console.error('WebSocket error:', error);
+    setConnectionStatus('error');
+  };
+
+  const handleReconnect = () => {
+    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      setConnectionStatus('failed');
+      showSnackbar('Failed to reconnect after multiple attempts', 'error');
+      return;
+    }
+    setConnectionStatus('reconnecting');
+    setReconnectAttempts(prev => prev + 1);
+    reconnectTimeoutRef.current = setTimeout(() => {
+      console.log(`Attempting to reconnect (${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})...`);
+      connectWebSocket();
+    }, RECONNECT_INTERVAL);
+  };
+
+  const startHeartbeat = () => {
+    const heartbeatInterval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(JSON.stringify({ type: 'ping' }));
+        } catch (error) {
+          console.error('Failed to send heartbeat:', error);
+          clearInterval(heartbeatInterval);
+        }
+      } else {
+        clearInterval(heartbeatInterval);
+      }
+    }, 25000);
+    return () => clearInterval(heartbeatInterval);
+  };
+
+  const safeSendMessage = (message) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      showSnackbar('Not connected to server', 'error');
+      return false;
+    }
+    try {
+      wsRef.current.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      console.error('Error sending message:', error);
+      showSnackbar('Failed to send message', 'error');
+      return false;
+    }
+  };
+
+  useEffect(() => {
+    if (user && user.email) connectWebSocket();
+    else {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+        setWs(null);
+        setConnectionStatus('disconnected');
+      }
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    }
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+          wsRef.current.close();
+        }
+        wsRef.current = null;
+        setWs(null);
+      }
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    };
+  }, [user?.email]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  useEffect(() => {
+    const checkUser = async () => {
+      setLoading(true);
+      try {
+        const { data: { session }, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        if (session?.user) {
+          setUser(session.user);
+          showSnackbar(`Welcome back, ${session.user.email}!`, 'success');
+        } else {
+          setLoginDialogOpen(true);
+        }
+      } catch (error) {
+        console.error('Session check error:', error);
+        showSnackbar('Error checking session', 'error');
+      } finally {
+        setLoading(false);
+      }
+    };
+    checkUser();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        console.log('Auth event:', event);
+        if (event === 'SIGNED_IN' && session) {
+          setUser(session.user);
+          setLoginDialogOpen(false);
+          showSnackbar('Successfully signed in!', 'success');
+        } else if (event === 'SIGNED_OUT') {
+          setUser(null);
+          setLoginDialogOpen(true);
+          showSnackbar('You have been signed out', 'info');
+        } else if (event === 'PASSWORD_RECOVERY') {
+          setAuthView('reset-password');
+          setLoginDialogOpen(true);
+          showSnackbar('You can now reset your password', 'info');
+        } else if (event === 'USER_UPDATED') {
+          setUser(session?.user ?? null);
+          showSnackbar('Your profile has been updated', 'success');
+        }
+      }
+    );
+    return () => subscription?.unsubscribe();
+  }, []);
+
+  const showSnackbar = (message, severity = 'info') => {
+    setSnackbar({ open: true, message, severity });
+  };
+
+  const handleCloseSnackbar = (event, reason) => {
+    if (reason === 'clickaway') return;
+    setSnackbar({ ...snackbar, open: false });
+  };
+
+  const handleSendMessage = (e) => {
+    e.preventDefault();
+    if (!inputMessage.trim() || !wsRef.current || !user || connectionStatus !== 'connected') {
+      if (connectionStatus !== 'connected') showSnackbar('Not connected to the chat server.', 'warning');
+      return;
+    }
+    const messageId = `user-${Date.now()}`;
+    const newMessage = {
+      id: messageId,
+      content: inputMessage,
+      sender: 'user',
+      timestamp: new Date().toISOString()
+    };
+    setMessages([...messages, newMessage]);
+    setInputMessage('');
+    setTypingIndicator(true);
+    safeSendMessage({
+      type: 'message',
+      message: inputMessage,
+      sessionId: user.email
+    });
+  };
+
+  const renderAuthDialog = () => {
+    const getDialogTitle = () => {
+      switch (authView) {
+        case 'login': return 'Sign In';
+        case 'signup': return 'Create Account';
+        case 'reset-password': return authPassword ? 'Set New Password' : 'Reset Password';
+        case 'magic-link': return 'Sign In with Magic Link';
+        default: return 'Authentication';
+      }
+    };
+    
+    return (
+      <Dialog
+        open={loginDialogOpen}
+        fullWidth
+        maxWidth="xs"
+        onClose={() => user && setLoginDialogOpen(false)}
+      >
+        <DialogTitle sx={{ pb: 1 }}>
+          {authView !== 'login' && authView !== 'signup' && (
+            <IconButton
+              edge="start"
+              color="inherit"
+              onClick={() => setAuthView('login')}
+              aria-label="back"
+              sx={{ mr: 1 }}
+            >
+              <ArrowBackIcon />
+            </IconButton>
+          )}
+          {getDialogTitle()}
+        </DialogTitle>
+        
+        {(authView === 'login' || authView === 'signup') && (
+          <Tabs
+            value={authView}
+            onChange={(e, newValue) => { setAuthView(newValue); clearAuthFields(); }}
+            centered
+            sx={{ borderBottom: 1, borderColor: 'divider' }}
+          >
+            <Tab label="Sign In" value="login" />
+            <Tab label="Sign Up" value="signup" />
+          </Tabs>
+        )}
+        
+        <DialogContent>
+          <Box component="form" onSubmit={handleAuthSubmit} sx={{ mt: 1 }}>
+            <TextField 
+              margin="normal" 
+              required 
+              fullWidth 
+              id="email" 
+              label="Email Address" 
+              name="email" 
+              autoComplete="email" 
+              autoFocus 
+              value={authEmail} 
+              onChange={(e) => setAuthEmail(e.target.value)} 
+              InputProps={{ 
+                startAdornment: <EmailIcon color="action" sx={{ mr: 1 }} /> 
+              }} 
+            />
+            
+            {(authView === 'login' || authView === 'signup' || (authView === 'reset-password' && authPassword !== undefined)) && (
+              <TextField 
+                margin="normal" 
+                required 
+                fullWidth 
+                name="password" 
+                label="Password" 
+                type="password" 
+                id="password" 
+                autoComplete={authView === 'signup' ? 'new-password' : 'current-password'} 
+                value={authPassword} 
+                onChange={(e) => setAuthPassword(e.target.value)} 
+                InputProps={{ 
+                  startAdornment: <LockIcon color="action" sx={{ mr: 1 }} /> 
+                }} 
+              />
+            )}
+            
+            {authView === 'signup' && (
+              <TextField 
+                margin="normal" 
+                required 
+                fullWidth 
+                name="confirmPassword" 
+                label="Confirm Password" 
+                type="password" 
+                id="confirmPassword" 
+                autoComplete="new-password" 
+                value={confirmPassword} 
+                onChange={(e) => setConfirmPassword(e.target.value)} 
+                error={confirmPassword !== '' && confirmPassword !== authPassword} 
+                helperText={confirmPassword !== '' && confirmPassword !== authPassword ? 'Passwords do not match' : ''} 
+                InputProps={{ 
+                  startAdornment: <LockIcon color="action" sx={{ mr: 1 }} /> 
+                }} 
+              />
+            )}
+            
+            <Button 
+              type="submit" 
+              fullWidth 
+              variant="contained" 
+              sx={{ mt: 3, mb: 2 }} 
+              disabled={loading || (authView === 'signup' && authPassword !== confirmPassword)}
+            >
+              {loading ? (
+                <CircularProgress size={24} />
+              ) : (
+                {
+                  'login': 'Sign In',
+                  'signup': 'Create Account',
+                  'reset-password': authPassword ? 'Set New Password' : 'Send Reset Link',
+                  'magic-link': 'Send Magic Link'
+                }[authView]
+              )}
+            </Button>
+            
+            {authView === 'login' && (
+              <Box sx={{ mt: 1, display: 'flex', justifyContent: 'space-between' }}>
+                <Link 
+                  component="button" 
+                  variant="body2" 
+                  onClick={() => { 
+                    setAuthView('reset-password'); 
+                    clearAuthFields(); 
+                  }}
+                >
+                  Forgot password?
+                </Link>
+                <Link 
+                  component="button" 
+                  variant="body2" 
+                  onClick={() => { 
+                    setAuthView('magic-link'); 
+                    clearAuthFields(); 
+                  }}
+                >
+                  Sign in with Magic Link
+                </Link>
+              </Box>
+            )}
+            
+            {(authView === 'login' || authView === 'signup') && (
+              <>
+                <Divider sx={{ mt: 2, mb: 2 }}><Chip label="OR" /></Divider>
+                <Grid container spacing={2}>
+                  <Grid item xs={12}>
+                    <Button 
+                      fullWidth 
+                      variant="outlined" 
+                      startIcon={<GoogleIcon />} 
+                      onClick={() => handleSocialLogin('google')} 
+                      disabled={loading}
+                    >
+                      Continue with Google
+                    </Button>
+                  </Grid>
+                  <Grid item xs={6}>
+                    <Button 
+                      fullWidth 
+                      variant="outlined" 
+                      startIcon={<GitHubIcon />} 
+                      onClick={() => handleSocialLogin('github')} 
+                      disabled={loading}
+                    >
+                      GitHub
+                    </Button>
+                  </Grid>
+                  <Grid item xs={6}>
+                    <Button 
+                      fullWidth 
+                      variant="outlined" 
+                      startIcon={<FacebookIcon />} 
+                      onClick={() => handleSocialLogin('facebook')} 
+                      disabled={loading}
+                    >
+                      Facebook
+                    </Button>
+                  </Grid>
+                </Grid>
+              </>
+            )}
+          </Box>
+        </DialogContent>
+      </Dialog>
+    );
+  };
+  
+  const renderConnectionStatus = () => {
+    const getStatusComponent = () => {
+      switch (connectionStatus) {
+        case 'connected':
+          return (
+            <Chip
+              size="small"
+              label="Connected"
+              color="success"
+              sx={{ mr: 1 }}
+              icon={<Box sx={{ 
+                width: 8, 
+                height: 8, 
+                bgcolor: 'success.main', 
+                borderRadius: '50%',
+                mr: -0.5 
+              }} />}
+            />
+          );
+        case 'disconnected':
+          return (
+            <Chip
+              size="small"
+              label="Disconnected"
+              color="error"
+              sx={{ mr: 1 }}
+              icon={<Box sx={{ 
+                width: 8, 
+                height: 8, 
+                bgcolor: 'error.main', 
+                borderRadius: '50%',
+                mr: -0.5 
+              }} />}
+            />
+          );
+        case 'reconnecting':
+          return (
+            <Chip
+              size="small"
+              label="Reconnecting..."
+              color="warning"
+              sx={{ mr: 1 }}
+              icon={<CircularProgress size={8} sx={{ mr: -0.5 }} />}
+            />
+          );
+        case 'error':
+        case 'failed':
+          return (
+            <Chip
+              size="small"
+              label={connectionStatus === 'error' ? 'Connection Error' : 'Connection Failed'}
+              color="error"
+              sx={{ mr: 1 }}
+              icon={<Box sx={{ 
+                width: 8, 
+                height: 8, 
+                bgcolor: 'error.main', 
+                borderRadius: '50%',
+                mr: -0.5 
+              }} />}
+            />
+          );
+        default:
+          return null;
+      }
+    };
+    
+    return isMobile ? 
+      <Box sx={{ mr: 1 }}>{getStatusComponent()}</Box> : 
+      getStatusComponent();
+  };
+
+  const renderAssistantHeader = () => {
+    const config = assistantConfig[currentAssistant] || assistantConfig.ToGeneralAssistant;
+
+    return (
+      <Box sx={{ position: 'relative' }}>
+        {/* Only show transfer animation if transferInProgress is true */}
+        {previousAssistant && transferInProgress && (
+          <Fade in={transferInProgress} timeout={{ exit: 500 }}>
+            <Paper 
+              elevation={3}
+              sx={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                backgroundColor: assistantConfig[previousAssistant]?.color || '#1976d2',
+                color: 'white',
+                padding: 2,
+                display: 'flex',
+                alignItems: 'center',
+                transition: 'all 0.5s ease',
+                opacity: 0.7,
+                transform: 'translateY(-10px)',
+              }}
+            >
+              <Avatar 
+                sx={{ 
+                  bgcolor: 'rgba(255, 255, 255, 0.2)', 
+                  color: 'white',
+                  mr: 2 
+                }}
+              >
+                {assistantConfig[previousAssistant]?.icon || <SupportIcon />}
+              </Avatar>
+              <Box>
+                <Typography variant="h6" sx={{ fontWeight: 500 }}>
+                  {assistantConfig[previousAssistant]?.name || 'Assistant'}
+                </Typography>
+              </Box>
+            </Paper>
+          </Fade>
+        )}
+        {transferInProgress && (
+          <Fade in={transferInProgress}>
+            <Box sx={{ 
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              height: '100%',
+              bgcolor: 'rgba(0,0,0,0.05)',
+              zIndex: 10,
+              backdropFilter: 'blur(2px)'
+            }}>
+              <CircularProgress size={28} />
+              <Typography variant="body2" sx={{ ml: 2, fontWeight: 500 }}>
+                Transferring to {config.name}...
+              </Typography>
+            </Box>
+          </Fade>
+        )}
+        {/* Always render the current assistant header, but it only animates on transfer */}
+        <Zoom in={!transferInProgress} style={{ 
+          transitionDelay: transferInProgress ? '300ms' : '0ms',
+        }}>
+          <Paper 
+            elevation={3}
+            sx={{
+              backgroundColor: config.color,
+              color: 'white',
+              padding: 2,
+              display: 'flex',
+              alignItems: 'center',
+              borderRadius: '0 0 12px 12px',
+              transition: 'all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+            }}
+          >
+            <Avatar 
+              sx={{ 
+                bgcolor: 'rgba(255, 255, 255, 0.2)', 
+                color: 'white',
+                mr: 2,
+                transform: transferInProgress ? 'scale(0.9)' : 'scale(1)',
+                transition: 'transform 0.3s ease'
+              }}
+            >
+              {config.icon}
+            </Avatar>
+            <Box sx={{ flex: 1 }}>
+              <Typography variant="h6" sx={{ 
+                fontWeight: 500,
+                transition: 'all 0.3s ease',
+                animation: transferInProgress ? 'none' : 'fadeIn 0.5s'
+              }}>
+                {config.name}
+              </Typography>
+              {!isMobile && (
+                <Typography variant="caption" sx={{ 
+                  opacity: 0.9,
+                  display: 'block', 
+                  transition: 'all 0.3s ease',
+                  animation: transferInProgress ? 'none' : 'slideIn 0.5s'
+                }}>
+                  {config.description}
+                </Typography>
+              )}
+            </Box>
+          </Paper>
+        </Zoom>
+      </Box>
+    );
+  };
+
+  const renderMessage = (message, index) => {
+    const isUser = message.sender === 'user';
+    const isSystem = message.sender === 'system';
+
+    const assistantType = message.assistantType || currentAssistant; // Fallback to currentAssistant
+    const msgAssistantConfig = !isUser && !isSystem ? (assistantConfig[assistantType] || assistantConfig.ToGeneralAssistant) : null;
+    
+    const bubbleColor = isUser ? theme.palette.primary.main : (msgAssistantConfig?.color || '#f5f5f5');
+    const textColor = isUser ? 'white' : (msgAssistantConfig ? theme.palette.getContrastText(msgAssistantConfig.color) : '#212121');
+
+    if (isSystem) {
+      return (
+        <ListItem
+          key={message.id || index}
+          sx={{
+            justifyContent: 'center',
+            py: 1,
+          }}
+        >
+          <Chip
+            label={message.content}
+            variant="outlined"
+            color="primary"
+            size="small"
+            sx={{ fontSize: '0.75rem', fontStyle: 'italic' }}
+          />
+        </ListItem>
+      );
+    }
+
+    return (
+      <ListItem
+        key={message.id || index}
+        sx={{
+          flexDirection: 'column',
+          alignItems: isUser ? 'flex-end' : 'flex-start',
+          padding: '8px 16px',
+        }}
+      >
+        <Box
+          sx={{
+            position: 'relative',
+            backgroundColor: bubbleColor,
+            color: textColor,
+            borderRadius: isUser ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+            padding: '12px 16px',
+            maxWidth: '75%',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.1)',
+            '&::after': isUser ? {
+              content: '""',
+              position: 'absolute',
+              bottom: 0,
+              right: -8,
+              width: 10,
+              height: 10,
+              backgroundColor: theme.palette.primary.main, // Tail color for user
+              borderBottomLeftRadius: '50%'
+            } : { // Tail for assistant
+              content: '""',
+              position: 'absolute',
+              bottom: 0,
+              left: -8,
+              width: 10,
+              height: 10,
+              backgroundColor: bubbleColor,
+              borderBottomRightRadius: '50%'
+            }
+          }}
+        >
+          {!isUser && !isSystem && msgAssistantConfig && (
+            <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.5 }}>
+              <Avatar sx={{ width: 16, height: 16, mr: 0.5, bgcolor: 'rgba(0,0,0,0.1)', color: textColor }}>
+                {msgAssistantConfig.icon}
+              </Avatar>
+              <Typography variant="caption" sx={{ fontWeight: 500, opacity: 0.8, color: textColor }}>
+                {msgAssistantConfig.name || 'Assistant'}
+              </Typography>
+            </Box>
+          )}
+          <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap' }}>
+            {message.content}
+            {message.streaming && (
+              <Box component="span" sx={{
+                display: 'inline-block',
+                width: '8px',
+                height: '1em',
+                backgroundColor: textColor,
+                animation: 'blinkingCursor 0.7s infinite',
+                marginLeft: '2px',
+                '@keyframes blinkingCursor': {
+                  '0%, 100%': { opacity: 1 },
+                  '50%': { opacity: 0 },
+                }
+              }}/>
+            )}
+          </Typography>
+        </Box>
+        <Box sx={{ 
+          display: 'flex', 
+          alignItems: 'center',
+          mt: 0.5, 
+          color: 'text.secondary' 
+        }}>
+          <Typography variant="caption" sx={{ fontSize: '0.7rem' }}>
+            {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </Typography>
+        </Box>
+      </ListItem>
+    );
+  };
+
+  const renderTypingIndicator = () => {
+    if (typingIndicator) {
+      const config = assistantConfig[currentAssistant] || {
+        color: '#1976d2',
+        icon: <SupportIcon fontSize="small" />
+      };
+
+      return (
+        <Box sx={{ 
+          display: 'flex', 
+          alignItems: 'center', 
+          pl: 2, 
+          pb: 1,
+          opacity: 0.7
+        }}>
+          <Avatar 
+            sx={{ 
+              width: 24, 
+              height: 24, 
+              mr: 1, 
+              bgcolor: config.color
+            }}
+          >
+            {config.icon}
+          </Avatar>
+          <Box sx={{ 
+            display: 'flex',
+            alignItems: 'center'
+          }}>
+            <Box sx={{ 
+              display: 'flex', 
+              alignItems: 'flex-end', 
+              height: 20 
+            }}>
+              {[0, 1, 2].map((i) => (
+                <Box
+                  key={i}
+                  component="span"
+                  sx={{
+                    width: 5,
+                    height: 5,
+                    margin: '0 1px',
+                    borderRadius: '50%',
+                    background: config.color,
+                    display: 'inline-block',
+                    animation: 'typing-animation 1.5s infinite',
+                    animationDelay: `${i * 0.2}s`,
+                    '@keyframes typing-animation': {
+                      '0%, 60%, 100%': {
+                        transform: 'translateY(0)',
+                      },
+                      '30%': {
+                        transform: 'translateY(-5px)',
+                      },
+                    },
+                  }}
+                />
+              ))}
+            </Box>
+            <Typography variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>
+              {assistantConfig[currentAssistant]?.name || 'Assistant'} is typing...
+            </Typography>
+          </Box>
+        </Box>
+      );
+    }
+    return null;
+  };
+
+  const renderMessageInput = () => {
+    return (
+      <Box component="form" onSubmit={handleSendMessage} sx={{ p: 2, backgroundColor: '#f8f9fa' }}>
+        <Grid container spacing={1} alignItems="center">
+          <Grid item xs>
+            <TextField
+              fullWidth
+              variant="outlined"
+              placeholder="Type your message..."
+              value={inputMessage}
+              onChange={(e) => setInputMessage(e.target.value)}
+              disabled={loading || connectionStatus !== 'connected' || !user}
+              onKeyPress={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  handleSendMessage(e);
+                }
+              }}
+              sx={{
+                '& .MuiOutlinedInput-root': {
+                  borderRadius: '24px',
+                  backgroundColor: '#ffffff',
+                  boxShadow: '0 2px 4px rgba(0,0,0,0.05)',
+                  transition: 'box-shadow 0.2s ease',
+                  '&:hover': {
+                    boxShadow: '0 3px 6px rgba(0,0,0,0.1)',
+                  },
+                  '&.Mui-focused': {
+                    boxShadow: '0 4px 8px rgba(0,0,0,0.1)',
+                  }
+                },
+                '& .MuiOutlinedInput-notchedOutline': {
+                  borderColor: 'rgba(0, 0, 0, 0.12)',
+                }
+              }}
+              InputProps={{
+                endAdornment: (
+                  <Fade in={typingIndicator}>
+                    <CircularProgress size={16} color="primary" sx={{ mr: 1 }} />
+                  </Fade>
+                )
+              }}
+            />
+          </Grid>
+          <Grid item>
+            <IconButton
+              color="primary"
+              type="submit"
+              disabled={!inputMessage.trim() || loading || connectionStatus !== 'connected' || !user}
+              sx={{
+                backgroundColor: theme.palette.primary.main,
+                color: 'white',
+                width: 48,
+                height: 48,
+                boxShadow: '0 2px 5px rgba(0,0,0,0.2)',
+                '&:hover': {
+                  backgroundColor: theme.palette.primary.dark,
+                },
+                '&.Mui-disabled': {
+                  backgroundColor: 'rgba(0, 0, 0, 0.12)',
+                  color: 'rgba(0, 0, 0, 0.26)',
+                }
+              }}
+            >
+              {loading ? <CircularProgress size={24} color="inherit" /> : <SendIcon />}
+            </IconButton>
+          </Grid>
+        </Grid>
+      </Box>
+    );
+  };
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
+      {renderAuthDialog()}
+
+      <Snackbar open={snackbar.open} autoHideDuration={6000} onClose={handleCloseSnackbar} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
+        <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: '100%' }}>{snackbar.message}</Alert>
+      </Snackbar>
+
+      <AppBar position="static" elevation={0} sx={{ bgcolor: 'white', color: 'text.primary', borderBottom: '1px solid rgba(0, 0, 0, 0.12)' }}>
+        <Toolbar>
+          <Box sx={{ display: 'flex', alignItems: 'center' }}>
+            <Typography variant="h6" component="div" sx={{ 
+              fontWeight: 600, 
+              background: 'linear-gradient(45deg, #3f51b5 30%, #00796b 90%)',
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent'
+            }}>
+              RamsesAI Support
+            </Typography>
+            <Chip 
+              label="Beta" 
+              size="small" 
+              sx={{ ml: 1, height: 20, fontSize: '0.6rem' }} 
+              color="secondary" 
+            />
+          </Box>
+
+          <Box sx={{ flexGrow: 1 }} />
+
+          {/* Add Delete Conversation button for logged-in users */}
+          {user && (
+            <Button
+              variant="outlined"
+              color="error"
+              size="small"
+              sx={{ mr: 2, textTransform: 'none' }}
+              onClick={handleDeleteConversation}
+            >
+              Delete Conversation
+            </Button>
+          )}
+
+          {renderConnectionStatus()}
+
+          {user && (
+            <>
+              <Badge
+                overlap="circular"
+                anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+                variant="dot"
+                color="success"
+              >
+                <Avatar sx={{ bgcolor: theme.palette.primary.main, ml: 2, width: 36, height: 36 }} alt={user.email} src={user.user_metadata?.avatar_url || ''}>
+                  {user.email?.[0]?.toUpperCase()}
+                </Avatar>
+              </Badge>
+              {!isMobile && (
+                <Typography variant="subtitle2" sx={{ ml: 1, mr: 2 }}>
+                  {user.email}
+                </Typography>
+              )}
+              <IconButton color="inherit" onClick={handleLogout} disabled={loading} size="small">
+                {loading ? <CircularProgress size={24} color="inherit" /> : <LogoutIcon />}
+              </IconButton>
+            </>
+          )}
+        </Toolbar>
+      </AppBar>
+
+      {renderAssistantHeader()}
+
+      <Container
+        maxWidth="md"
+        sx={{
+          flexGrow: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          py: 2,
+          px: { xs: 1, sm: 2 }
+        }}
+      >
+        <Paper
+          elevation={2}
+          sx={{
+            flexGrow: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            maxHeight: 'calc(100vh - 180px)',
+            overflow: 'hidden',
+            borderRadius: 2,
+            border: '1px solid rgba(0, 0, 0, 0.08)'
+          }}
+        >
+          <Box sx={{
+            flexGrow: 1,
+            overflow: 'auto',
+            backgroundImage: 'url("https://www.transparenttextures.com/patterns/subtle-white-feathers.png")',
+            backgroundColor: '#f5f7fa'
+          }}>
+            <List sx={{ py: 2 }}>
+              {messages.length === 0 && !user && (
+                <ListItem>
+                  <ListItemText primary={
+                    <Typography variant="body1" align="center" sx={{ color: 'text.secondary', py: 4 }}>
+                      Please sign in to start chatting.
+                    </Typography>
+                  } />
+                </ListItem>
+              )}
+
+              {messages.length === 0 && user && (
+                <Box sx={{ 
+                  py: 8, 
+                  display: 'flex', 
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}>
+                  <Avatar 
+                    sx={{ 
+                      width: 80, 
+                      height: 80,
+                      mb: 2,
+                      p: 1,
+                      bgcolor: theme.palette.primary.light
+                    }}
+                  >
+                    <SupportIcon sx={{ fontSize: 40, color: 'white' }} />
+                  </Avatar>
+                  <Typography variant="h5" sx={{ mb: 1, fontWeight: 500 }}>
+                    Welcome to RamsesAI Support
+                  </Typography>
+                  <Typography variant="body1" sx={{ color: 'text.secondary', textAlign: 'center', maxWidth: '80%' }}>
+                    How can we help you today? Our AI assistant is ready to answer your questions.
+                  </Typography>
+                </Box>
+              )}
+
+              {messages.map(renderMessage)}
+              {renderTypingIndicator()}
+              <div ref={messagesEndRef} />
+            </List>
+          </Box>
+
+          <Divider />
+
+          {renderMessageInput()}
+        </Paper>
+      </Container>
+      
+      <Box sx={{
+        '@keyframes fadeIn': {
+          '0%': { opacity: 0 },
+          '100%': { opacity: 1 }
+        },
+        '@keyframes slideIn': {
+          '0%': { transform: 'translateY(-5px)', opacity: 0 },
+          '100%': { transform: 'translateY(0)', opacity: 0.9 }
+        }
+      }} />
+    </Box>
+  );
+}
+
+export default App;
