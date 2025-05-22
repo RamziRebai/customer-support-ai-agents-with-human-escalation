@@ -13,7 +13,7 @@ The RamsesAI Support Chatbot is an intelligent, multi-agent chat application des
 * **Smart Routing by Agents:** While an initial “gateway” agent (also implemented as a LangGraph node) can route new queries, any specialized agent can dynamically transfer a user to another agent if the topic shifts. Conversely, if an agent is capable of resolving the issue, it will continue handling the conversation end-to-end.  
 * **Persistent, Single-Agent Conversations:** Once a user is interacting with a LangGraph agent, they can have a multi-turn dialogue with that same agent—there is no need to bounce back through the generic router for each follow-up. This preserves context within that agent’s domain and reduces latency.  
 * **Human Escalation:** At any point, the user can request human support; this action triggers an email notification to the appropriate support team.  
-* **Persistent Conversations Across Sessions:** LangGraph’s state store ensures that each agent’s chat history is saved locally (in MongoDB). Users can pick up exactly where they left off if they return.  
+* **Persistent Conversations Across Sessions:** LangGraph’s state store ensures that each agent’s chat history is saved locally (in PostgresQL). Users can pick up exactly where they left off if they return.  
 * **Real-Time Streaming:** All AI responses are streamed character-by-character via Socket.IO for a more interactive feel.
 
  ![Multi-AI-Agents](multi-ai-agents.png)
